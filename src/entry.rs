@@ -2,7 +2,7 @@
 use miette::SourceSpan;
 use std::{fmt::Display, str::FromStr};
 
-use crate::{v2_parser, KdlIdentifier, KdlParseFailure, KdlValue};
+use crate::{v2_parser, KdlError, KdlIdentifier, KdlValue};
 
 /// KDL Entries are the "arguments" to KDL nodes: either a (positional)
 /// [`Argument`](https://github.com/kdl-org/kdl/blob/main/SPEC.md#argument) or
@@ -83,7 +83,7 @@ impl KdlEntry {
 
     /// Gets this entry's span.
     ///
-    /// This value will be properly initialized when created via [`KdlDocument::parse`]
+    /// This value will be properly initialized when created via [`crate::KdlDocument::parse`]
     /// but may become invalidated if the document is mutated. We do not currently
     /// guarantee this to yield any particularly consistent results at that point.
     #[cfg(feature = "span")]
@@ -161,9 +161,17 @@ impl KdlEntry {
         self.len() == 0
     }
 
+    /// Keeps the general entry formatting, though v1 entries will still be
+    /// updated to v2 while preserving as much as possible.
+    pub fn keep_format(&mut self) {
+        if let Some(fmt) = self.format_mut() {
+            fmt.autoformat_keep = true;
+        }
+    }
+
     /// Auto-formats this entry.
     pub fn autoformat(&mut self) {
-        // TODO once MSRV allows:
+        // TODO once MSRV allows (1.80.0):
         //self.format.take_if(|f| !f.autoformat_keep);
         if !self
             .format
@@ -171,11 +179,224 @@ impl KdlEntry {
             .map(|f| f.autoformat_keep)
             .unwrap_or(false)
         {
-            self.format = None
+            self.format = None;
+        } else {
+            #[cfg(feature = "v1")]
+            self.ensure_v2();
+            self.format = self.format.take().map(|f| KdlEntryFormat {
+                value_repr: f.value_repr,
+                leading: f.leading,
+                ..Default::default()
+            });
         }
 
         if let Some(name) = &mut self.name {
             name.autoformat();
+        }
+    }
+
+    /// Parses a string into a entry.
+    ///
+    /// If the `v1-fallback` feature is enabled, this method will first try to
+    /// parse the string as a KDL v2 entry, and, if that fails, it will try
+    /// to parse again as a KDL v1 entry. If both fail, only the v2 parse
+    /// errors will be returned.
+    pub fn parse(s: &str) -> Result<Self, KdlError> {
+        #[cfg(not(feature = "v1-fallback"))]
+        {
+            v2_parser::try_parse(v2_parser::padded_node_entry, s)
+        }
+        #[cfg(feature = "v1-fallback")]
+        {
+            v2_parser::try_parse(v2_parser::padded_node_entry, s)
+                .or_else(|e| KdlEntry::parse_v1(s).map_err(|_| e))
+        }
+    }
+
+    /// Parses a KDL v1 string into an entry.
+    #[cfg(feature = "v1")]
+    pub fn parse_v1(s: &str) -> Result<Self, KdlError> {
+        let ret: Result<kdlv1::KdlEntry, kdlv1::KdlError> = s.parse();
+        ret.map(|x| x.into()).map_err(|e| e.into())
+    }
+
+    /// Makes sure this entry is in v2 format.
+    pub fn ensure_v2(&mut self) {
+        let value_repr = self.format.as_ref().map(|x| {
+            match &self.value {
+                KdlValue::String(val) => {
+                    // cleanup. I don't _think_ this should have any whitespace,
+                    // but just in case.
+                    let s = x.value_repr.trim();
+                    // convert raw strings to new format
+                    let s = s.strip_prefix('r').unwrap_or(s);
+                    let s = if crate::value::is_plain_ident(val) {
+                        val.into()
+                    } else if s
+                        .find(|c| v2_parser::NEWLINES.iter().any(|nl| nl.contains(c)))
+                        .is_some()
+                    {
+                        // Multiline string. Need triple quotes if they're not there already.
+                        if s.contains("\"\"\"") {
+                            // We're probably good. This could be more precise, but close enough.
+                            s.to_string()
+                        } else {
+                            // `"` -> `"""` but also extra newlines need to be
+                            // added because v2 strips the first and last ones.
+                            let s = s.replacen('\"', "\"\"\"\n", 1);
+                            s.chars()
+                                .rev()
+                                .collect::<String>()
+                                .replacen('\"', "\"\"\"\n", 1)
+                                .chars()
+                                .rev()
+                                .collect::<String>()
+                        }
+                    } else if !s.starts_with('#') {
+                        // `/` is no longer an escaped char in v2.
+                        s.replace("\\/", "/")
+                    } else {
+                        // We're all good! Let's move on.
+                        s.to_string()
+                    };
+                    s
+                }
+                // These have `#` prefixes now. The regular Display impl will
+                // take care of that.
+                KdlValue::Bool(_) | KdlValue::Null => format!("{}", self.value),
+                // These should be fine as-is?
+                KdlValue::Integer(_) | KdlValue::Float(_) => x.value_repr.clone(),
+            }
+        });
+
+        if let Some(value_repr) = value_repr.as_ref() {
+            self.format = Some(
+                self.format
+                    .clone()
+                    .map(|mut x| {
+                        x.value_repr = value_repr.into();
+                        x
+                    })
+                    .unwrap_or_else(|| KdlEntryFormat {
+                        value_repr: value_repr.into(),
+                        leading: " ".into(),
+                        ..Default::default()
+                    }),
+            )
+        }
+    }
+
+    /// Makes sure this entry is in v1 format.
+    #[cfg(feature = "v1")]
+    pub fn ensure_v1(&mut self) {
+        let value_repr = self.format.as_ref().map(|x| {
+            match &self.value {
+                KdlValue::String(val) => {
+                    // cleanup. I don't _think_ this should have any whitespace,
+                    // but just in case.
+                    let s = x.value_repr.trim();
+                    // convert raw strings to v1 format
+                    let s = if s.starts_with("#") {
+                        format!("r{s}")
+                    } else {
+                        s.to_string()
+                    };
+                    let s = if crate::value::is_plain_ident(val)
+                        && !s.starts_with('\"')
+                        && !s.starts_with("r#")
+                    {
+                        format!("\"{val}\"")
+                    } else if s
+                        .find(|c| v2_parser::NEWLINES.iter().any(|nl| nl.contains(c)))
+                        .is_some()
+                    {
+                        // Multiline string. Let's make sure it's v1.
+                        if s.contains("\"\"\"") {
+                            let prefix = s
+                                .chars()
+                                .rev()
+                                .skip_while(|c| c == &'"')
+                                .take_while(|c| {
+                                    v2_parser::NEWLINES.iter().any(|nl| nl.contains(*c))
+                                })
+                                .collect::<String>();
+                            let prefix = prefix.chars().rev().collect::<String>();
+                            // Sigh. Yeah. I didn't promise this would be _efficient_.
+                            let mut s = s;
+                            for nl in v2_parser::NEWLINES {
+                                s = s.replace(&format!("{nl}{prefix}"), nl);
+                            }
+                            // And now we strips the beginning and ending newlines.
+                            // Finally, replace `"""` with `"`.
+                            s
+                        } else {
+                            // It's already a v1 string
+                            s
+                        }
+                    } else if !s.starts_with("r#") {
+                        // `/` is an escaped char in v2
+                        let s = s.replace("\\/", "/"); // Maneuvering. Will fix in a sec.
+                        s.replace('/', "\\/")
+                    } else {
+                        // We're all good! Let's move on.
+                        s.to_string()
+                    };
+                    s
+                }
+                // No more # prefix for these
+                KdlValue::Bool(b) => b.to_string(),
+                KdlValue::Null => "null".to_string(),
+                // These should be fine as-is?
+                KdlValue::Integer(_) | KdlValue::Float(_) => x.value_repr.clone(),
+            }
+        });
+
+        if let Some(value_repr) = value_repr.as_ref() {
+            self.format = Some(
+                self.format
+                    .clone()
+                    .map(|mut x| {
+                        x.value_repr = value_repr.into();
+                        x
+                    })
+                    .unwrap_or_else(|| KdlEntryFormat {
+                        value_repr: value_repr.into(),
+                        leading: " ".into(),
+                        ..Default::default()
+                    }),
+            )
+        } else {
+            let v1_val = match self.value() {
+                KdlValue::String(s) => kdlv1::KdlValue::String(s.clone()),
+                KdlValue::Integer(i) => kdlv1::KdlValue::Base10(*i as i64),
+                KdlValue::Float(f) => kdlv1::KdlValue::Base10Float(*f),
+                KdlValue::Bool(b) => kdlv1::KdlValue::Bool(*b),
+                KdlValue::Null => kdlv1::KdlValue::Null,
+            };
+            self.format = Some(KdlEntryFormat {
+                value_repr: v1_val.to_string(),
+                leading: " ".into(),
+                ..Default::default()
+            })
+        }
+    }
+}
+
+#[cfg(feature = "v1")]
+impl From<kdlv1::KdlEntry> for KdlEntry {
+    fn from(value: kdlv1::KdlEntry) -> Self {
+        KdlEntry {
+            ty: value.ty().map(|x| x.clone().into()),
+            value: value.value().clone().into(),
+            name: value.name().map(|x| x.clone().into()),
+            format: Some(KdlEntryFormat {
+                value_repr: value.value_repr().unwrap_or("").into(),
+                leading: value.leading().unwrap_or("").into(),
+                trailing: value.trailing().unwrap_or("").into(),
+                ..Default::default()
+            }),
+            #[cfg(feature = "span")]
+            span: SourceSpan::new(value.span().offset().into(), value.span().len()),
         }
     }
 }
@@ -246,10 +467,10 @@ where
 }
 
 impl FromStr for KdlEntry {
-    type Err = KdlParseFailure;
+    type Err = KdlError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        v2_parser::try_parse(v2_parser::padded_node_entry, s)
+        KdlEntry::parse(s)
     }
 }
 
@@ -410,5 +631,60 @@ mod test {
 
         let entry = KdlEntry::new_prop("name", KdlValue::Integer(42));
         assert_eq!(format!("{}", entry), "name=42");
+    }
+
+    #[cfg(feature = "v1")]
+    #[test]
+    fn v1_to_v2_format() -> miette::Result<()> {
+        let mut entry = KdlEntry::parse_v1(r##"r#"hello, world!"#"##)?;
+        entry.keep_format();
+        entry.autoformat();
+        assert_eq!(format!("{}", entry), r##" #"hello, world!"#"##);
+
+        let mut entry = KdlEntry::parse_v1(r#""hello, \" world!""#)?;
+        entry.keep_format();
+        entry.autoformat();
+        assert_eq!(format!("{}", entry), r#" "hello, \" world!""#);
+
+        let mut entry = KdlEntry::parse_v1("\"foo!`~.,<>\"")?;
+        entry.keep_format();
+        entry.autoformat();
+        assert_eq!(format!("{}", entry), " foo!`~.,<>");
+
+        let mut entry = KdlEntry::parse_v1("\"\nhello, world!\"")?;
+        entry.keep_format();
+        entry.autoformat();
+        assert_eq!(format!("{}", entry), " \"\"\"\n\nhello, world!\n\"\"\"");
+
+        let mut entry = KdlEntry::parse_v1("r#\"\nhello, world!\"#")?;
+        entry.keep_format();
+        entry.autoformat();
+        assert_eq!(format!("{}", entry), " #\"\"\"\n\nhello, world!\n\"\"\"#");
+
+        let mut entry = KdlEntry::parse_v1("true")?;
+        entry.keep_format();
+        entry.autoformat();
+        assert_eq!(format!("{}", entry), " #true");
+
+        let mut entry = KdlEntry::parse_v1("false")?;
+        entry.keep_format();
+        entry.autoformat();
+        assert_eq!(format!("{}", entry), " #false");
+
+        let mut entry = KdlEntry::parse_v1("null")?;
+        entry.keep_format();
+        entry.autoformat();
+        assert_eq!(format!("{}", entry), " #null");
+
+        let mut entry = KdlEntry::parse_v1("1_234_567")?;
+        entry.keep_format();
+        entry.autoformat();
+        assert_eq!(format!("{}", entry), " 1_234_567");
+
+        let mut entry = KdlEntry::parse_v1("1_234_567E-10")?;
+        entry.keep_format();
+        entry.autoformat();
+        assert_eq!(format!("{}", entry), " 1_234_567E-10");
+        Ok(())
     }
 }

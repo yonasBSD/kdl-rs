@@ -2,7 +2,7 @@
 use miette::SourceSpan;
 use std::{fmt::Display, str::FromStr};
 
-use crate::{v2_parser, KdlParseFailure, KdlValue};
+use crate::{v2_parser, KdlError, KdlValue};
 
 /// Represents a KDL
 /// [Identifier](https://github.com/kdl-org/kdl/blob/main/SPEC.md#identifier).
@@ -42,7 +42,7 @@ impl KdlIdentifier {
 
     /// Gets this identifier's span.
     ///
-    /// This value will be properly initialized when created via [`KdlDocument::parse`]
+    /// This value will be properly initialized when created via [`crate::KdlDocument::parse`]
     /// but may become invalidated if the document is mutated. We do not currently
     /// guarantee this to yield any particularly consistent results at that point.
     #[cfg(feature = "span")]
@@ -87,6 +87,43 @@ impl KdlIdentifier {
     pub fn autoformat(&mut self) {
         self.repr = None;
     }
+
+    /// Parses a string into a entry.
+    ///
+    /// If the `v1-fallback` feature is enabled, this method will first try to
+    /// parse the string as a KDL v2 entry, and, if that fails, it will try
+    /// to parse again as a KDL v1 entry. If both fail, only the v2 parse
+    /// errors will be returned.
+    pub fn parse(s: &str) -> Result<Self, KdlError> {
+        #[cfg(not(feature = "v1-fallback"))]
+        {
+            v2_parser::try_parse(v2_parser::identifier, s)
+        }
+        #[cfg(feature = "v1-fallback")]
+        {
+            v2_parser::try_parse(v2_parser::identifier, s)
+                .or_else(|e| KdlIdentifier::parse_v1(s).map_err(|_| e))
+        }
+    }
+
+    /// Parses a KDL v1 string into an entry.
+    #[cfg(feature = "v1")]
+    pub fn parse_v1(s: &str) -> Result<Self, KdlError> {
+        let ret: Result<kdlv1::KdlIdentifier, kdlv1::KdlError> = s.parse();
+        ret.map(|x| x.into()).map_err(|e| e.into())
+    }
+}
+
+#[cfg(feature = "v1")]
+impl From<kdlv1::KdlIdentifier> for KdlIdentifier {
+    fn from(value: kdlv1::KdlIdentifier) -> Self {
+        KdlIdentifier {
+            value: value.value().into(),
+            repr: value.repr().map(|x| x.into()),
+            #[cfg(feature = "span")]
+            span: (value.span().offset(), value.span().len()).into(),
+        }
+    }
 }
 
 impl Display for KdlIdentifier {
@@ -128,10 +165,10 @@ impl From<KdlIdentifier> for String {
 }
 
 impl FromStr for KdlIdentifier {
-    type Err = KdlParseFailure;
+    type Err = KdlError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        v2_parser::try_parse(v2_parser::identifier, s)
+        KdlIdentifier::parse(s)
     }
 }
 

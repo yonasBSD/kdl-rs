@@ -174,7 +174,7 @@ impl Display for KdlValue {
     }
 }
 
-fn is_plain_ident(ident: &str) -> bool {
+pub(crate) fn is_plain_ident(ident: &str) -> bool {
     let ident_bytes = ident.as_bytes();
     ident
         .find(crate::v2_parser::is_disallowed_ident_char)
@@ -257,6 +257,23 @@ where
         match value {
             Some(value) => value.into(),
             None => KdlValue::Null,
+        }
+    }
+}
+
+#[cfg(feature = "v1")]
+impl From<kdlv1::KdlValue> for KdlValue {
+    fn from(value: kdlv1::KdlValue) -> Self {
+        match value {
+            kdlv1::KdlValue::RawString(s) => KdlValue::String(s),
+            kdlv1::KdlValue::String(s) => KdlValue::String(s),
+            kdlv1::KdlValue::Base2(i) => KdlValue::Integer(i.into()),
+            kdlv1::KdlValue::Base8(i) => KdlValue::Integer(i.into()),
+            kdlv1::KdlValue::Base10(i) => KdlValue::Integer(i.into()),
+            kdlv1::KdlValue::Base10Float(f) => KdlValue::Float(f),
+            kdlv1::KdlValue::Base16(i) => KdlValue::Integer(i.into()),
+            kdlv1::KdlValue::Bool(b) => KdlValue::Bool(b),
+            kdlv1::KdlValue::Null => KdlValue::Null,
         }
     }
 }

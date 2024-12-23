@@ -2,7 +2,9 @@
 use miette::SourceSpan;
 use std::fmt::Display;
 
-use crate::{FormatConfig, KdlNode, KdlParseFailure, KdlValue};
+#[cfg(feature = "v1")]
+use crate::KdlNodeFormat;
+use crate::{FormatConfig, KdlError, KdlNode, KdlValue};
 
 /// Represents a KDL
 /// [`Document`](https://github.com/kdl-org/kdl/blob/main/SPEC.md#document).
@@ -108,7 +110,7 @@ impl KdlDocument {
         self.get(name).and_then(|node| node.get(0))
     }
 
-    /// Gets the all node arguments (value) of the first child node with a
+    /// Returns an iterator of the all node arguments (value) of the first child node with a
     /// matching name. This is a shorthand utility for cases where a document
     /// is being used as a key/value store and the value is expected to be
     /// array-ish.
@@ -127,16 +129,18 @@ impl KdlDocument {
     /// ```rust
     /// # use kdl::{KdlDocument, KdlValue};
     /// # let doc: KdlDocument = "foo 1 2 3\nbar #false".parse().unwrap();
-    /// assert_eq!(doc.get_args("foo"), vec![&1.into(), &2.into(), &3.into()]);
+    /// assert_eq!(
+    ///   doc.iter_args("foo").collect::<Vec<&KdlValue>>(),
+    ///   vec![&1.into(), &2.into(), &3.into()]
+    /// );
     /// ```
-    pub fn get_args(&self, name: &str) -> Vec<&KdlValue> {
+    pub fn iter_args(&self, name: &str) -> impl Iterator<Item = &KdlValue> {
         self.get(name)
             .map(|n| n.entries())
             .unwrap_or_default()
             .iter()
             .filter(|e| e.name().is_none())
             .map(|e| e.value())
-            .collect()
     }
 
     /// Gets a mutable reference to the first argument (value) of the first
@@ -164,9 +168,12 @@ impl KdlDocument {
     /// ```rust
     /// # use kdl::{KdlDocument, KdlValue};
     /// # let doc: KdlDocument = "foo {\n - 1\n - 2\n - #false\n}".parse().unwrap();
-    /// assert_eq!(doc.get_dash_args("foo"), vec![&1.into(), &2.into(), &false.into()]);
+    /// assert_eq!(
+    ///     doc.iter_dash_args("foo").collect::<Vec<&KdlValue>>(),
+    ///     vec![&1.into(), &2.into(), &false.into()]
+    /// );
     /// ```
-    pub fn get_dash_args(&self, name: &str) -> Vec<&KdlValue> {
+    pub fn iter_dash_args(&self, name: &str) -> impl Iterator<Item = &KdlValue> {
         self.get(name)
             .and_then(|n| n.children())
             .map(|doc| doc.nodes())
@@ -174,7 +181,6 @@ impl KdlDocument {
             .iter()
             .filter(|e| e.name().value() == "-")
             .filter_map(|e| e.get(0))
-            .collect()
     }
 
     /// Returns a reference to this document's child nodes.
@@ -215,7 +221,7 @@ impl KdlDocument {
     /// Clears leading and trailing text (whitespace, comments). `KdlNode`s in
     /// this document will be unaffected.
     ///
-    /// If you need to clear the `KdlNode`s, use [`Self::clear_fmt_recursive`].
+    /// If you need to clear the `KdlNode`s, use [`Self::clear_format_recursive`].
     pub fn clear_format(&mut self) {
         self.format = None;
     }
@@ -330,13 +336,130 @@ impl KdlDocument {
     //         .query_all(query)?
     //         .filter_map(move |node| node.get(key.clone())))
     // }
+
+    /// Parses a string into a document.
+    ///
+    /// If the `v1-fallback` feature is enabled, this method will first try to
+    /// parse the string as a KDL v2 document, and, if that fails, it will try
+    /// to parse again as a KDL v1 document. If both fail, only the v2 parse
+    /// errors will be returned.
+    pub fn parse(s: &str) -> Result<Self, KdlError> {
+        #[cfg(not(feature = "v1-fallback"))]
+        {
+            KdlDocument::parse_v2(s)
+        }
+        #[cfg(feature = "v1-fallback")]
+        {
+            KdlDocument::parse_v2(s).or_else(|e| KdlDocument::parse_v1(s).map_err(|_| e))
+        }
+    }
+
+    /// Parses a KDL v2 string into a document.
+    pub fn parse_v2(s: &str) -> Result<Self, KdlError> {
+        crate::v2_parser::try_parse(crate::v2_parser::document, s)
+    }
+
+    /// Parses a KDL v1 string into a document.
+    #[cfg(feature = "v1")]
+    pub fn parse_v1(s: &str) -> Result<Self, KdlError> {
+        let ret: Result<kdlv1::KdlDocument, kdlv1::KdlError> = s.parse();
+        ret.map(|x| x.into()).map_err(|e| e.into())
+    }
+
+    /// Takes a KDL v1 document string and returns the same document, but
+    /// autoformatted into valid KDL v2 syntax.
+    #[cfg(feature = "v1")]
+    pub fn v1_to_v2(s: &str) -> Result<String, KdlError> {
+        let mut doc = KdlDocument::parse_v1(s)?;
+        doc.ensure_v2();
+        Ok(doc.to_string())
+    }
+
+    /// Takes a KDL v2 document string and returns the same document, but
+    /// autoformatted into valid KDL v2 syntax.
+    #[cfg(feature = "v1")]
+    pub fn v2_to_v1(s: &str) -> Result<String, KdlError> {
+        let mut doc = KdlDocument::parse_v2(s)?;
+        doc.ensure_v1();
+        Ok(doc.to_string())
+    }
+
+    /// Makes sure this document is in v2 format.
+    pub fn ensure_v2(&mut self) {
+        // No need to touch KdlDocumentFormat, probably. In the longer term,
+        // we'll want to make sure to parse out whitespace and comments and make
+        // sure they're actually compliant, but this is good enough for now.
+        for node in self.nodes_mut().iter_mut() {
+            node.ensure_v2();
+        }
+    }
+
+    /// Makes sure this document is in v1 format.
+    #[cfg(feature = "v1")]
+    pub fn ensure_v1(&mut self) {
+        // No need to touch KdlDocumentFormat, probably. In the longer term,
+        // we'll want to make sure to parse out whitespace and comments and make
+        // sure they're actually compliant, but this is good enough for now.
+
+        // the last node in v1 docs/children has to have a semicolon.
+        let mut iter = self.nodes_mut().iter_mut().rev();
+        let last = iter.next();
+        let penult = iter.next();
+        if let Some(last) = last {
+            if let Some(fmt) = last.format_mut() {
+                if !fmt.trailing.contains(";")
+                    && fmt
+                        .trailing
+                        .chars()
+                        .any(|c| crate::v2_parser::NEWLINES.iter().any(|nl| nl.contains(c)))
+                {
+                    fmt.terminator = ";".into();
+                }
+            } else {
+                let maybe_indent = {
+                    if let Some(penult) = penult {
+                        if let Some(fmt) = penult.format() {
+                            fmt.leading.clone()
+                        } else {
+                            "".into()
+                        }
+                    } else {
+                        "".into()
+                    }
+                };
+                last.format = Some(KdlNodeFormat {
+                    leading: maybe_indent,
+                    terminator: "\n".into(),
+                    ..Default::default()
+                })
+            }
+        }
+        for node in self.nodes_mut().iter_mut() {
+            node.ensure_v1();
+        }
+    }
+}
+
+#[cfg(feature = "v1")]
+impl From<kdlv1::KdlDocument> for KdlDocument {
+    fn from(value: kdlv1::KdlDocument) -> Self {
+        KdlDocument {
+            nodes: value.nodes().iter().map(|x| x.clone().into()).collect(),
+            format: Some(KdlDocumentFormat {
+                leading: value.leading().unwrap_or("").into(),
+                trailing: value.trailing().unwrap_or("").into(),
+            }),
+            #[cfg(feature = "span")]
+            span: SourceSpan::new(value.span().offset().into(), value.span().len()),
+        }
+    }
 }
 
 impl std::str::FromStr for KdlDocument {
-    type Err = KdlParseFailure;
+    type Err = KdlError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        crate::v2_parser::try_parse(crate::v2_parser::document, s)
+        KdlDocument::parse(s)
     }
 }
 
@@ -441,8 +564,8 @@ second_node /* This time, the comment is here */ param=153 {
             /* block comment */
             inline /*comment*/ here
             another /-comment there
-            
-            
+
+
             after some whitespace
             trailing /* multiline */
             trailing // single line
@@ -480,7 +603,7 @@ final;";
 
         assert_eq!(doc.get_arg("foo"), Some(&1.into()));
         assert_eq!(
-            doc.get_dash_args("foo"),
+            doc.iter_dash_args("foo").collect::<Vec<&KdlValue>>(),
             vec![&1.into(), &2.into(), &"three".into()]
         );
         assert_eq!(
@@ -531,7 +654,6 @@ final;";
         // if you're making KdlEntries this way, you need to inject
         // your own whitespace (or format the node)
         node.push(" \"blah\"=0xDEADbeef".parse::<KdlEntry>()?);
-        dbg!(&node);
         doc.nodes_mut().push(node);
 
         assert_eq!(
@@ -582,7 +704,7 @@ baz
 
  // child 2 comment
 
-        child2 2 // comment
+        child2 2 /-3 // comment
 
                child3    "
 
@@ -617,7 +739,7 @@ baz
 foo 1 bar=0xdeadbeef {
     child1 1
     // child 2 comment
-    child2 2 // comment
+    child2 2 /-3 // comment
     child3 "\nstring\t" {
         /*
 
@@ -887,7 +1009,7 @@ inline { time; to; live "our" "dreams"; "y;all" }
         check_span("time", inline_nodes[0].span(), &input);
         check_span("to", inline_nodes[1].span(), &input);
         check_span(r#"live "our" "dreams""#, inline_nodes[2].span(), &input);
-        check_span(r#""y;all""#, inline_nodes[3].span(), &input);
+        check_span(r#""y;all" "#, inline_nodes[3].span(), &input);
 
         Ok(())
     }
@@ -901,6 +1023,177 @@ inline { time; to; live "our" "dreams"; "y;all" }
         include_str!("../examples/website.kdl").parse::<KdlDocument>()?;
         include_str!("../examples/zellij.kdl").parse::<KdlDocument>()?;
         include_str!("../examples/zellij-unquoted-bindings.kdl").parse::<KdlDocument>()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "v1")]
+    #[test]
+    fn v1_v2_conversions() -> miette::Result<()> {
+        let v1 = r##"
+// If you'd like to override the default keybindings completely, be sure to change "keybinds" to "keybinds clear-defaults=true"
+keybinds {
+    normal {
+        // uncomment this and adjust key if using copy_on_select=false
+        // bind "Alt c" { Copy; }
+    }
+    locked {
+        bind "Ctrl g" { SwitchToMode "Normal"; }
+    }
+    resize {
+        bind "Ctrl n" { SwitchToMode "Normal"; }
+        bind "h" "Left" { Resize "Increase Left"; }
+        bind "j" "Down" { Resize "Increase Down"; }
+        bind "k" "Up" { Resize "Increase Up"; }
+        bind "l" "Right" { Resize "Increase Right"; }
+        bind "H" { Resize "Decrease Left"; }
+        bind "J" { Resize "Decrease Down"; }
+        bind "K" { Resize "Decrease Up"; }
+        bind "L" { Resize "Decrease Right"; }
+        bind "=" "+" { Resize "Increase"; }
+        bind "-" { Resize "Decrease"; }
+    }
+}
+// Plugin aliases - can be used to change the implementation of Zellij
+// changing these requires a restart to take effect
+plugins {
+    tab-bar location="zellij:tab-bar"
+    status-bar location="zellij:status-bar"
+    welcome-screen location="zellij:session-manager" {
+        welcome_screen true
+    }
+    filepicker location="zellij:strider" {
+        cwd "\/"
+    }
+}
+mouse_mode false
+mirror_session true
+"##;
+        let v2 = r##"
+// If you'd like to override the default keybindings completely, be sure to change "keybinds" to "keybinds clear-defaults=true"
+keybinds {
+    normal {
+        // uncomment this and adjust key if using copy_on_select=false
+        // bind "Alt c" { Copy; }
+    }
+    locked {
+        bind "Ctrl g" { SwitchToMode Normal; }
+    }
+    resize {
+        bind "Ctrl n" { SwitchToMode Normal; }
+        bind h Left { Resize "Increase Left"; }
+        bind j Down { Resize "Increase Down"; }
+        bind k Up { Resize "Increase Up"; }
+        bind l Right { Resize "Increase Right"; }
+        bind H { Resize "Decrease Left"; }
+        bind J { Resize "Decrease Down"; }
+        bind K { Resize "Decrease Up"; }
+        bind L { Resize "Decrease Right"; }
+        bind "=" + { Resize Increase; }
+        bind - { Resize Decrease; }
+    }
+}
+// Plugin aliases - can be used to change the implementation of Zellij
+// changing these requires a restart to take effect
+plugins {
+    tab-bar location=zellij:tab-bar
+    status-bar location=zellij:status-bar
+    welcome-screen location=zellij:session-manager {
+        welcome_screen #true
+    }
+    filepicker location=zellij:strider {
+        cwd "/"
+    }
+}
+mouse_mode #false
+mirror_session #true
+"##;
+        pretty_assertions::assert_eq!(KdlDocument::v1_to_v2(v1)?, v2, "Converting a v1 doc to v2");
+        pretty_assertions::assert_eq!(KdlDocument::v2_to_v1(v2)?, v1, "Converting a v2 doc to v1");
+        Ok(())
+    }
+
+    #[cfg(feature = "v1")]
+    #[test]
+    fn v2_to_v1() -> miette::Result<()> {
+        let original = r##"
+// If you'd like to override the default keybindings completely, be sure to change "keybinds" to "keybinds clear-defaults=true"
+keybinds {
+    normal {
+        // uncomment this and adjust key if using copy_on_select=false
+        // bind "Alt c" { Copy; }
+    }
+    locked {
+        bind "Ctrl g" { SwitchToMode "Normal"; }
+    }
+    resize {
+        bind "Ctrl n" { SwitchToMode "Normal"; }
+        bind "h" "Left" { Resize "Increase Left"; }
+        bind "j" "Down" { Resize "Increase Down"; }
+        bind "k" "Up" { Resize "Increase Up"; }
+        bind "l" "Right" { Resize "Increase Right"; }
+        bind "H" { Resize "Decrease Left"; }
+        bind "J" { Resize "Decrease Down"; }
+        bind "K" { Resize "Decrease Up"; }
+        bind "L" { Resize "Decrease Right"; }
+        bind "=" "+" { Resize "Increase"; }
+        bind "-" { Resize "Decrease"; }
+    }
+}
+// Plugin aliases - can be used to change the implementation of Zellij
+// changing these requires a restart to take effect
+plugins {
+    tab-bar location="zellij:tab-bar"
+    status-bar location="zellij:status-bar"
+    welcome-screen location="zellij:session-manager" {
+        welcome_screen true
+    }
+    filepicker location="zellij:strider" {
+        cwd "/"
+    }
+}
+mouse_mode false
+mirror_session true
+"##;
+        let expected = r##"
+// If you'd like to override the default keybindings completely, be sure to change "keybinds" to "keybinds clear-defaults=true"
+keybinds {
+    normal {
+        // uncomment this and adjust key if using copy_on_select=false
+        // bind "Alt c" { Copy; }
+    }
+    locked {
+        bind "Ctrl g" { SwitchToMode Normal; }
+    }
+    resize {
+        bind "Ctrl n" { SwitchToMode Normal; }
+        bind h Left { Resize "Increase Left"; }
+        bind j Down { Resize "Increase Down"; }
+        bind k Up { Resize "Increase Up"; }
+        bind l Right { Resize "Increase Right"; }
+        bind H { Resize "Decrease Left"; }
+        bind J { Resize "Decrease Down"; }
+        bind K { Resize "Decrease Up"; }
+        bind L { Resize "Decrease Right"; }
+        bind "=" + { Resize Increase; }
+        bind - { Resize Decrease; }
+    }
+}
+// Plugin aliases - can be used to change the implementation of Zellij
+// changing these requires a restart to take effect
+plugins {
+    tab-bar location=zellij:tab-bar
+    status-bar location=zellij:status-bar
+    welcome-screen location=zellij:session-manager {
+        welcome_screen #true
+    }
+    filepicker location=zellij:strider {
+        cwd "/"
+    }
+}
+mouse_mode #false
+mirror_session #true
+"##;
+        pretty_assertions::assert_eq!(KdlDocument::v1_to_v2(original)?, expected);
         Ok(())
     }
 }
