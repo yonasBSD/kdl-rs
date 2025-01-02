@@ -1,5 +1,27 @@
 # `kdl` Release Changelog
 
+
+<a name="6.2.1"></a>
+## 6.2.1 (2025-01-02)
+
+### Bug Fixes
+
+* **fallback:** uggghhhhh oops ([7ec3992c](https://github.com/kdl-org/kdl-rs/commit/7ec3992ceb83c590df8e0e68c16fda02a3b1eeed))
+
+<a name="6.2.0"></a>
+## 6.2.0 (2025-01-01)
+
+More Compliant Than Ever Before™️
+
+### Features
+
+* **fallback:** apply heuristics when doing fallbacks (#111) ([f5007fce](https://github.com/kdl-org/kdl-rs/commit/f5007fce44523c594888214ed171fed0955ef1f5))
+
+
+### Bug Fixes
+
+* **parser:** various tests and bugfixes (#112) ([52a7c2cb](https://github.com/kdl-org/kdl-rs/commit/52a7c2cba131155e3a21756578dd59cc1a2156b8))
+
 <a name="6.1.0"></a>
 ## 6.1.0 (2024-12-22)
 
